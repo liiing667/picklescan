@@ -286,6 +286,162 @@ def test_scan_zip_bytes():
     )
 
 
+def _build_zip_buffer(members):
+    """Build an in-memory deflated ZIP from a list of (name, bytes) members."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip:
+        for name, data in members:
+            zip.writestr(name, data)
+    return bytearray(buffer.getvalue())
+
+
+def _local_header_offset(raw, member_index):
+    """Return the offset of the *member_index*-th local file header."""
+    offset = -1
+    for _ in range(member_index + 1):
+        offset = raw.find(b"PK\x03\x04", offset + 1)
+        assert offset != -1
+    return offset
+
+
+def _corrupt_local_header(raw, member_index):
+    """Corrupt the local file header signature so opening the member fails."""
+    offset = _local_header_offset(raw, member_index)
+    raw[offset : offset + 4] = b"XX\x03\x04"
+
+
+def _corrupt_deflate_stream(raw, member_index):
+    """Flip the last byte of a member's deflate stream to break decompression."""
+    offset = _local_header_offset(raw, member_index)
+    name_length = int.from_bytes(raw[offset + 26 : offset + 28], "little")
+    extra_length = int.from_bytes(raw[offset + 28 : offset + 30], "little")
+    compressed_size = int.from_bytes(raw[offset + 18 : offset + 22], "little")
+    data_start = offset + 30 + name_length + extra_length
+    raw[data_start + compressed_size - 1] ^= 0xFF
+
+
+def test_scan_zip_corrupt_member_header_sets_scan_err():
+    # A member whose local header is corrupted must fail closed: scan_err is set,
+    # scanning continues and globals from the healthy member are retained.
+    raw = _build_zip_buffer(
+        [
+            ("broken.pkl", pickle.dumps({"a": 1})),
+            ("healthy.pkl", pickle.dumps(Malicious1())),
+        ]
+    )
+    _corrupt_local_header(raw, 0)
+
+    result = scan_zip_bytes(io.BytesIO(bytes(raw)), "corrupt.zip")
+
+    assert result.scan_err is True
+    assert result.globals == [Global("builtins", "eval", SafetyLevel.Dangerous)]
+    assert result.issues_count == 1
+    assert result.infected_files == 1
+
+
+def test_scan_zip_truncated_member_decompression_sets_scan_err():
+    # A truncated/corrupted deflate stream raises zlib.error while reading the member.
+    # The error must be captured as scan_err instead of aborting the whole scan,
+    # and globals already found in healthy members must be preserved.
+    raw = _build_zip_buffer(
+        [
+            ("broken.pkl", b"hello world " * 200),
+            ("healthy.pkl", pickle.dumps(Malicious1())),
+        ]
+    )
+    _corrupt_deflate_stream(raw, 0)
+
+    result = scan_zip_bytes(io.BytesIO(bytes(raw)), "truncated.zip")
+
+    assert result.scan_err is True
+    assert result.globals == [Global("builtins", "eval", SafetyLevel.Dangerous)]
+    assert result.issues_count == 1
+    assert result.infected_files == 1
+
+
+def test_scan_zip_multiple_broken_members_keeps_healthy_results():
+    # Several unreadable members still let the remaining healthy members be scanned,
+    # and a single scan_err flag summarizes the failure.
+    raw = _build_zip_buffer(
+        [
+            ("broken_header.pkl", pickle.dumps({"a": 1})),
+            ("broken_stream.pkl", b"hello world " * 200),
+            ("healthy.pkl", pickle.dumps(Malicious1())),
+        ]
+    )
+    _corrupt_local_header(raw, 0)
+    _corrupt_deflate_stream(raw, 1)
+
+    result = scan_zip_bytes(io.BytesIO(bytes(raw)), "multi_broken.zip")
+
+    assert result.scan_err is True
+    assert result.globals == [Global("builtins", "eval", SafetyLevel.Dangerous)]
+    assert result.issues_count == 1
+
+
+def test_scan_zip_broken_member_strict_mode_compatible():
+    # Strict mode must remain compatible with the fail-closed behavior: a broken member
+    # sets scan_err while a healthy member is still classified under strict rules.
+    raw = _build_zip_buffer(
+        [
+            ("broken.pkl", pickle.dumps({"a": 1})),
+            ("suspicious.pkl", pickle.dumps(Suspicious())),
+        ]
+    )
+    _corrupt_local_header(raw, 0)
+
+    result = scan_zip_bytes(io.BytesIO(bytes(raw)), "strict.zip", strict=True)
+
+    assert result.scan_err is True
+    assert result.globals == [Global("collections", "Counter", SafetyLevel.Dangerous)]
+    assert result.issues_count == 1
+
+
+def test_scan_zip_healthy_archive_has_no_scan_err_in_strict_mode():
+    # Regression guard: ordinary, fully readable ZIPs never set scan_err,
+    # including in strict mode (CRC mismatches stay tolerated for PyTorch).
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zip:
+        zip.writestr("suspicious.pkl", pickle.dumps(Suspicious()))
+
+    default_result = scan_zip_bytes(io.BytesIO(buffer.getbuffer()), "ok.zip")
+    assert default_result.scan_err is False
+    assert default_result.globals == [Global("collections", "Counter", SafetyLevel.Suspicious)]
+
+    strict_result = scan_zip_bytes(io.BytesIO(buffer.getbuffer()), "ok.zip", strict=True)
+    assert strict_result.scan_err is False
+    assert strict_result.globals == [Global("collections", "Counter", SafetyLevel.Dangerous)]
+
+
+def test_main_returns_2_on_corrupt_zip_member(tmp_path, monkeypatch):
+    # CLI must fail closed with exit code 2 when a member cannot be opened/decompressed,
+    # while still reporting the globals discovered in healthy members.
+    raw = _build_zip_buffer(
+        [
+            ("broken.pkl", pickle.dumps({"a": 1})),
+            ("healthy.pkl", pickle.dumps(Malicious1())),
+        ]
+    )
+    _corrupt_local_header(raw, 0)
+    corrupt_archive = tmp_path / "corrupt.zip"
+    corrupt_archive.write_bytes(bytes(raw))
+
+    monkeypatch.setattr(sys, "argv", ["picklescan", "-p", str(corrupt_archive), "-g"])
+    assert main() == 2
+
+
+def test_main_returns_0_on_healthy_zip(tmp_path, monkeypatch):
+    # A healthy, threat-free ZIP keeps the normal success exit code (no false scan_err).
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zip:
+        zip.writestr("data.pkl", pickle.dumps({"a": 0, "b": 1}))
+    healthy_archive = tmp_path / "healthy.zip"
+    healthy_archive.write_bytes(buffer.getvalue())
+
+    monkeypatch.setattr(sys, "argv", ["picklescan", "-p", str(healthy_archive)])
+    assert main() == 0
+
+
 def test_scan_numpy():
     with open(f"{_root_path}/data2/object_array.npy", "rb") as f:
         compare_scan_results(
@@ -919,7 +1075,11 @@ def test_main():
     try:
         sys.argv = ["picklescan", "-u", "https://localhost/mock/pickle/benign"]
         assert main() == 0
-        importlib.import_module("picklescan.__main__")
+        # __main__ propagates main()'s return code through sys.exit(), so importing
+        # it as `python -m picklescan` does must raise SystemExit with the same code.
+        with pytest.raises(SystemExit) as exc_info:
+            importlib.import_module("picklescan.__main__")
+        assert exc_info.value.code == 0
     finally:
         sys.argv = argv
 

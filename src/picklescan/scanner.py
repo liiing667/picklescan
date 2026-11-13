@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 from typing import IO, List, Optional, Set, Tuple
 import urllib.parse
 import zipfile
+import zlib
 from .relaxed_zipfile import RelaxedZipFile
 
 from .torch import (
@@ -506,7 +507,15 @@ def scan_zip_bytes(data: IO[bytes], file_id, strict=False) -> ScanResult:
 
     result = ScanResult([])
 
-    with RelaxedZipFile(data, "r") as zip:
+    try:
+        zip = RelaxedZipFile(data, "r")
+    except (zipfile.BadZipFile, zlib.error, OSError) as e:
+        # The archive itself cannot be opened (e.g. truncated central directory):
+        # fail closed so a damaged PyTorch ZIP is never reported as safe.
+        _log.error("Could not open zip archive %s: %s", file_id, str(e))
+        return ScanResult([], scan_err=True)
+
+    with zip:
         file_names = zip.namelist()
         _log.debug("Files in zip archive %s: %s", file_id, file_names)
         for file_name in file_names:
@@ -524,9 +533,13 @@ def scan_zip_bytes(data: IO[bytes], file_id, strict=False) -> ScanResult:
                     _log.debug("Scanning file %s in zip archive %s", file_name, file_id)
                     with zip.open(file_name, "r") as file:
                         result.merge(scan_numpy(file, f"{file_id}:{file_name}", strict=strict))
-            except (zipfile.BadZipFile, RuntimeError) as e:
-                # Log decompression issues (password protected, corrupted, etc.)
-                _log.warning("Invalid file %s in zip archive %s: %s", file_name, file_id, str(e))
+            except (zipfile.BadZipFile, zlib.error, RuntimeError, OSError) as e:
+                # A member failed to open or decompress (truncated/corrupted entry, bad
+                # local header, unsupported compression, etc.). Keep scanning the other
+                # members and retain the globals already found, but flag the archive so
+                # the CLI fails closed instead of silently reporting it as safe.
+                _log.error("Invalid file %s in zip archive %s: %s", file_name, file_id, str(e))
+                result.scan_err = True
 
     return result
 
