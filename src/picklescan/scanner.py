@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import pickletools
+import posixpath
 import re
+import tarfile
 from tarfile import TarError
 from tempfile import TemporaryDirectory
 from typing import IO, List, Optional, Set, Tuple
@@ -71,6 +73,36 @@ class ScanFilter:
     include: List[re.Pattern] = field(default_factory=list)
     exclude_dir: List[re.Pattern] = field(default_factory=list)
     include_dir: List[re.Pattern] = field(default_factory=list)
+
+
+@dataclass
+class ArchiveScanContext:
+    """State and limits shared across a recursive archive scan.
+
+    - ``max_depth``: maximum nesting level for archives inside archives.
+    - ``max_member_size``: maximum decompressed size in bytes of a single archive member.
+    - ``max_total_size``: maximum cumulative decompressed size in bytes scanned per top-level scan.
+    - ``scanned_chains``: normalized ``archive:member`` chains already scanned, used to deduplicate members.
+    - ``scanned_size``: cumulative decompressed size in bytes scanned so far.
+    """
+
+    max_depth: int = 3
+    max_member_size: int = 1024**3
+    max_total_size: int = 4 * 1024**3
+    scanned_chains: Set[str] = field(default_factory=set)
+    scanned_size: int = 0
+
+    def charge_member(self, chain_id: str, size: int) -> bool:
+        """Account a member's decompressed size against the total scan budget."""
+        if self.scanned_size + size > self.max_total_size:
+            _log.warning(
+                "Skipping archive member %s: total scanned size budget of %d bytes exhausted",
+                chain_id,
+                self.max_total_size,
+            )
+            return False
+        self.scanned_size += size
+        return True
 
 
 class GenOpsError(Exception):
@@ -254,6 +286,10 @@ _numpy_file_extensions = {".npy"}  # Note: .npz is handled as zip files
 _pytorch_file_extensions = {".bin", ".pt", ".pth", ".ckpt"}
 _pickle_file_extensions = {".pkl", ".pickle", ".joblib", ".dat", ".data"}
 _zip_file_extensions = {".zip", ".npz", ".7z"}
+_tar_file_extensions = {".tar"}
+_archive_file_extensions = _zip_file_extensions | _tar_file_extensions
+_zip_magic_bytes = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_tar_magic_bytes = b"ustar"  # at offset 257 in the header block
 # Pickle files do not actually have magic bytes, but v2+ files
 # start with a PROTO (\x80) opcode followed by a byte with the protocol version
 _pickle_magic_bytes = {
@@ -281,6 +317,28 @@ def _is_7z_file(f: IO[bytes]) -> bool:
 
     local_header_magic_number = [b"7", b"z", b"\xbc", b"\xaf", b"\x27", b"\x1c"]
     return read_bytes == local_header_magic_number
+
+
+def _is_tar_file(f: IO[bytes]) -> bool:
+    start = f.tell()
+    try:
+        f.seek(257)
+        magic = f.read(len(_tar_magic_bytes))
+    except (OSError, ValueError):
+        return False
+    finally:
+        f.seek(start)
+    return magic == _tar_magic_bytes
+
+
+def _normalize_member_name(name: str) -> str:
+    """Normalize an archive member name so equivalent paths map to the same scan chain."""
+    normalized = posixpath.normpath(name.replace("\\", "/"))
+    if normalized == ".":
+        return ""
+    while normalized.startswith("../"):
+        normalized = normalized[len("../") :]
+    return normalized.lstrip("/")
 
 
 def _http_get(url) -> bytes:
@@ -476,57 +534,220 @@ def scan_pickle_bytes(data: IO[bytes], file_id, multiple_pickles=True, strict=Fa
     return _build_scan_result_from_raw_globals(raw_globals, file_id, strict=strict)
 
 
+def _scan_nested_archive(data: IO[bytes], chain_id: str, context: ArchiveScanContext, depth: int, strict: bool) -> ScanResult:
+    if zipfile.is_zipfile(data):
+        data.seek(0)
+        return scan_zip_bytes(data, chain_id, strict=strict, context=context, depth=depth)
+    data.seek(0)
+    if _is_7z_file(data):
+        return scan_7z_bytes(data, chain_id, strict=strict, context=context, depth=depth)
+    data.seek(0)
+    return scan_tar_bytes(data, chain_id, strict=strict, context=context, depth=depth)
+
+
+def _scan_archive_member(
+    data: IO[bytes],
+    chain_id: str,
+    file_ext: str,
+    member_size: int,
+    context: ArchiveScanContext,
+    depth: int,
+    strict: bool,
+) -> ScanResult:
+    """Scan a single archive member, recursing into nested archives."""
+    if member_size > context.max_member_size:
+        _log.warning(
+            "Skipping archive member %s: decompressed size %d exceeds the per-member limit of %d bytes",
+            chain_id,
+            member_size,
+            context.max_member_size,
+        )
+        return ScanResult([])
+
+    magic_bytes = data.read(8)
+    data.seek(0)
+
+    if (
+        any(magic_bytes.startswith(magic) for magic in _zip_magic_bytes)
+        or _is_7z_file(data)
+        or _is_tar_file(data)
+        or file_ext in _archive_file_extensions
+    ):
+        if depth + 1 > context.max_depth:
+            _log.warning(
+                "Skipping archive member %s: maximum archive nesting depth %d exceeded",
+                chain_id,
+                context.max_depth,
+            )
+            return ScanResult([])
+        if not context.charge_member(chain_id, member_size):
+            return ScanResult([])
+        # Nested archives are buffered in memory (bounded by max_member_size) so any archive type can be nested in any other
+        return _scan_nested_archive(io.BytesIO(data.read()), chain_id, context, depth + 1, strict)
+
+    if file_ext in _pickle_file_extensions or any(magic_bytes.startswith(mn) for mn in _pickle_magic_bytes):
+        _log.debug("Scanning file %s", chain_id)
+        if not context.charge_member(chain_id, member_size):
+            return ScanResult([])
+        return scan_pickle_bytes(data, chain_id, strict=strict)
+
+    if file_ext in _numpy_file_extensions or magic_bytes.startswith(_numpy_magic_bytes):
+        _log.debug("Scanning file %s", chain_id)
+        if not context.charge_member(chain_id, member_size):
+            return ScanResult([])
+        return scan_numpy(data, chain_id, strict=strict)
+
+    return ScanResult([])
+
+
 # XXX: it appears there is not way to get the byte stream for a given file within the 7z archive and thus forcing us to unzip to disk before scanning
-def scan_7z_bytes(data: IO[bytes], file_id, strict=False) -> ScanResult:
+def scan_7z_bytes(data: IO[bytes], file_id, strict=False, context: Optional[ArchiveScanContext] = None, depth: int = 0) -> ScanResult:
     _log.debug(f"scan_7z_bytes({file_id})")
 
     try:
         import py7zr
     except ImportError:
         raise Exception("py7zr is required to scan 7z archives, install picklescan using: 'pip install picklescan[7z]'")
+
+    if context is None:
+        context = ArchiveScanContext()
     result = ScanResult([])
 
     with py7zr.SevenZipFile(data, mode="r") as archive:
-        file_names = archive.getnames()
-        targets = [f for f in file_names if f.endswith(tuple(_pickle_file_extensions))]
-        _log.debug("Files in 7z archive %s: %s", file_id, targets)
+        members = []
+        for info in archive.list():
+            if info.is_directory:
+                continue
+            file_ext = os.path.splitext(info.filename)[1]
+            if (
+                file_ext not in _pickle_file_extensions
+                and file_ext not in _numpy_file_extensions
+                and file_ext not in _archive_file_extensions
+                and file_ext not in _pytorch_file_extensions
+            ):
+                continue
+            chain_id = f"{file_id}:{_normalize_member_name(info.filename)}"
+            if chain_id in context.scanned_chains:
+                _log.debug("Skipping already-scanned member %s", chain_id)
+                continue
+            context.scanned_chains.add(chain_id)
+            members.append((info.filename, chain_id, info.uncompressed))
+
+        _log.debug("Files in 7z archive %s: %s", file_id, [member[0] for member in members])
         with TemporaryDirectory() as tmpdir:
-            archive.extract(path=tmpdir, targets=targets)
-            for file_name in targets:
+            try:
+                archive.extract(path=tmpdir, targets=[member[0] for member in members])
+            except Exception as e:
+                _log.warning("Error extracting 7z archive %s: %s", file_id, e)
+                result.scan_err = True
+            for file_name, chain_id, member_size in members:
                 file_path = os.path.join(tmpdir, file_name)
-                _log.debug("Scanning file %s in 7z archive %s", file_name, file_id)
-                if os.path.isfile(file_path):
-                    result.merge(scan_file_path(file_path, strict=strict))
+                if not os.path.isfile(file_path):
+                    continue
+                try:
+                    with open(file_path, "rb") as file:
+                        result.merge(
+                            _scan_archive_member(
+                                file,
+                                chain_id,
+                                os.path.splitext(file_name)[1],
+                                member_size,
+                                context,
+                                depth,
+                                strict,
+                            )
+                        )
+                except Exception as e:
+                    # Isolate bad members so they don't affect siblings
+                    _log.warning("Invalid file %s in 7z archive %s: %s", file_name, file_id, str(e))
+                    result.scan_err = True
 
-            return result
+    return result
 
 
-def scan_zip_bytes(data: IO[bytes], file_id, strict=False) -> ScanResult:
+def scan_tar_bytes(data: IO[bytes], file_id, strict=False, context: Optional[ArchiveScanContext] = None, depth: int = 0) -> ScanResult:
+    _log.debug(f"scan_tar_bytes({file_id})")
+
+    if context is None:
+        context = ArchiveScanContext()
+    result = ScanResult([])
+
+    data.seek(0)
+    try:
+        archive = tarfile.open(fileobj=data, mode="r:*")
+    except TarError as e:
+        _log.warning("Invalid tar archive %s: %s", file_id, e)
+        return ScanResult([], scanned_files=1, scan_err=True)
+
+    with archive:
+        for member in archive.getmembers():
+            if not member.isreg():
+                continue
+            chain_id = f"{file_id}:{_normalize_member_name(member.name)}"
+            if chain_id in context.scanned_chains:
+                _log.debug("Skipping already-scanned member %s", chain_id)
+                continue
+            context.scanned_chains.add(chain_id)
+            try:
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                with extracted:
+                    result.merge(
+                        _scan_archive_member(
+                            extracted,
+                            chain_id,
+                            os.path.splitext(member.name)[1],
+                            member.size,
+                            context,
+                            depth,
+                            strict,
+                        )
+                    )
+            except Exception as e:
+                # Isolate bad members so they don't affect siblings
+                _log.warning("Invalid file %s in tar archive %s: %s", member.name, file_id, str(e))
+                result.scan_err = True
+
+    return result
+
+
+def scan_zip_bytes(data: IO[bytes], file_id, strict=False, context: Optional[ArchiveScanContext] = None, depth: int = 0) -> ScanResult:
     _log.debug(f"scan_zip_bytes({file_id})")
 
+    if context is None:
+        context = ArchiveScanContext()
     result = ScanResult([])
 
     with RelaxedZipFile(data, "r") as zip:
         file_names = zip.namelist()
         _log.debug("Files in zip archive %s: %s", file_id, file_names)
         for file_name in file_names:
+            if file_name.endswith("/"):
+                continue  # directory entry
+            chain_id = f"{file_id}:{_normalize_member_name(file_name)}"
+            if chain_id in context.scanned_chains:
+                _log.debug("Skipping already-scanned member %s", chain_id)
+                continue
+            context.scanned_chains.add(chain_id)
             try:
+                member_size = zip.getinfo(file_name).file_size
                 with zip.open(file_name, "r") as file:
-                    magic_bytes = file.read(8)
-                file_ext = os.path.splitext(file_name)[1]
-
-                if file_ext in _pickle_file_extensions or any(magic_bytes.startswith(mn) for mn in _pickle_magic_bytes):
-                    _log.debug("Scanning file %s in zip archive %s", file_name, file_id)
-                    with zip.open(file_name, "r") as file:
-                        result.merge(scan_pickle_bytes(file, f"{file_id}:{file_name}", strict=strict))
-
-                elif file_ext in _numpy_file_extensions or magic_bytes.startswith(_numpy_magic_bytes):
-                    _log.debug("Scanning file %s in zip archive %s", file_name, file_id)
-                    with zip.open(file_name, "r") as file:
-                        result.merge(scan_numpy(file, f"{file_id}:{file_name}", strict=strict))
-            except (zipfile.BadZipFile, RuntimeError) as e:
-                # Log decompression issues (password protected, corrupted, etc.)
+                    result.merge(
+                        _scan_archive_member(
+                            file,
+                            chain_id,
+                            os.path.splitext(file_name)[1],
+                            member_size,
+                            context,
+                            depth,
+                            strict,
+                        )
+                    )
+            except Exception as e:
+                # Isolate bad members (password protected, corrupted, etc.) so they don't affect siblings
                 _log.warning("Invalid file %s in zip archive %s: %s", file_name, file_id, str(e))
+                result.scan_err = True
 
     return result
 
@@ -567,14 +788,14 @@ def scan_numpy(data: IO[bytes], file_id, strict=False) -> ScanResult:
         return scan_pickle_bytes(data, file_id, strict=strict)
 
 
-def scan_pytorch(data: IO[bytes], file_id, strict=False) -> ScanResult:
+def scan_pytorch(data: IO[bytes], file_id, strict=False, context: Optional[ArchiveScanContext] = None, depth: int = 0) -> ScanResult:
     _log.debug(f"scan_pytorch({file_id})")
 
     # new pytorch format
     if _is_zipfile(data):
-        return scan_zip_bytes(data, file_id, strict=strict)
+        return scan_zip_bytes(data, file_id, strict=strict, context=context, depth=depth)
     elif _is_7z_file(data):
-        return scan_7z_bytes(data, file_id, strict=strict)
+        return scan_7z_bytes(data, file_id, strict=strict, context=context, depth=depth)
     # old pytorch format
     else:
         scan_result = ScanResult([])
@@ -613,12 +834,19 @@ def scan_pytorch(data: IO[bytes], file_id, strict=False) -> ScanResult:
         return scan_result
 
 
-def scan_bytes(data: IO[bytes], file_id, file_ext: Optional[str] = None, strict=False) -> ScanResult:
+def scan_bytes(
+    data: IO[bytes],
+    file_id,
+    file_ext: Optional[str] = None,
+    strict=False,
+    context: Optional[ArchiveScanContext] = None,
+    depth: int = 0,
+) -> ScanResult:
     _log.debug(f"scan_bytes({file_id})")
 
     if file_ext is not None and file_ext in _pytorch_file_extensions:
         try:
-            return scan_pytorch(data, file_id, strict=strict)
+            return scan_pytorch(data, file_id, strict=strict, context=context, depth=depth)
         except InvalidMagicError as e:
             _log.warning(
                 f"WARNING: Invalid PyTorch magic number for file {e}. Trying to scan as non-PyTorch file.",
@@ -632,9 +860,11 @@ def scan_bytes(data: IO[bytes], file_id, file_ext: Optional[str] = None, strict=
     is_zip = zipfile.is_zipfile(data)
     data.seek(0)
     if is_zip:
-        return scan_zip_bytes(data, file_id, strict=strict)
+        return scan_zip_bytes(data, file_id, strict=strict, context=context, depth=depth)
     elif _is_7z_file(data):
-        return scan_7z_bytes(data, file_id, strict=strict)
+        return scan_7z_bytes(data, file_id, strict=strict, context=context, depth=depth)
+    elif _is_tar_file(data) or (file_ext is not None and file_ext in _tar_file_extensions):
+        return scan_tar_bytes(data, file_id, strict=strict, context=context, depth=depth)
     else:
         return scan_pickle_bytes(data, file_id, strict=strict)
 
@@ -650,7 +880,12 @@ def scan_huggingface_model(repo_id, strict=False):
     scan_result = ScanResult([])
     for file_name in file_names:
         file_ext = os.path.splitext(file_name)[1]
-        if file_ext not in _zip_file_extensions and file_ext not in _pickle_file_extensions and file_ext not in _pytorch_file_extensions:
+        if (
+            file_ext not in _zip_file_extensions
+            and file_ext not in _tar_file_extensions
+            and file_ext not in _pickle_file_extensions
+            and file_ext not in _pytorch_file_extensions
+        ):
             continue
         _log.debug("Scanning file %s in model %s", file_name, repo_id)
         url = f"https://huggingface.co/{repo_id}/resolve/main/{file_name}"
@@ -689,6 +924,7 @@ def scan_directory_path(path, scan_filter: Optional[ScanFilter] = None, strict=F
             file_ext = os.path.splitext(file_name)[1]
             if (
                 file_ext not in _zip_file_extensions
+                and file_ext not in _tar_file_extensions
                 and file_ext not in _pickle_file_extensions
                 and file_ext not in _pytorch_file_extensions
             ):

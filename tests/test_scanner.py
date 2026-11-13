@@ -5,6 +5,7 @@ import os
 import pickle
 import re
 import sys
+import tarfile
 from typing import Union
 from unittest import TestCase
 
@@ -13,6 +14,7 @@ import zipfile
 
 from picklescan.cli import main
 from picklescan.scanner import (
+    ArchiveScanContext,
     Global,
     SafetyLevel,
     ScanFilter,
@@ -22,6 +24,7 @@ from picklescan.scanner import (
     _build_scan_result_from_raw_globals,
     _unsafe_globals,
     scan_pickle_bytes,
+    scan_tar_bytes,
     scan_zip_bytes,
     scan_directory_path,
     scan_file_path,
@@ -87,12 +90,30 @@ class MockHTTPSConnection:
             with zipfile.ZipFile(buffer, "w") as zip:
                 zip.writestr("data.pkl", pickle.dumps(Malicious1()))
             self.response = HTTPResponse(200, buffer.getbuffer())
+        elif target == "GET https://localhost/mock/zip/nested_malicious":
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as zip:
+                zip.writestr("data.pkl", pickle.dumps(Malicious1()))
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as zip:
+                zip.writestr("inner.zip", inner.getvalue())
+            self.response = HTTPResponse(200, buffer.getbuffer())
         elif target == "GET https://huggingface.co/api/models/ykilcher/totally-harmless-model":
             self.response = HTTPResponse(200, b'{"siblings": [{"rfilename": "pytorch_model.bin"}]}')
         elif target == "GET https://huggingface.co/ykilcher/totally-harmless-model/resolve/main/pytorch_model.bin":
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w") as zip:
                 zip.writestr("archive/data.pkl", pickle.dumps(Malicious1()))
+            self.response = HTTPResponse(200, buffer.getbuffer())
+        elif target == "GET https://huggingface.co/api/models/ykilcher/nested-archive-model":
+            self.response = HTTPResponse(200, b'{"siblings": [{"rfilename": "pytorch_model.bin"}]}')
+        elif target == "GET https://huggingface.co/ykilcher/nested-archive-model/resolve/main/pytorch_model.bin":
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as zip:
+                zip.writestr("archive/data.pkl", pickle.dumps(Malicious1()))
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as zip:
+                zip.writestr("inner.zip", inner.getvalue())
             self.response = HTTPResponse(200, buffer.getbuffer())
         else:
             raise ValueError(f"No mock for request '{target}'")
@@ -1040,3 +1061,127 @@ def test_scan_directory_empty_filter():
     sr = scan_directory_path(f"{_root_path}/data/", scan_filter=sf)
     sr_default = scan_directory_path(f"{_root_path}/data/")
     assert sr.scanned_files == sr_default.scanned_files
+
+
+# ---------------------------------------------------------------------------
+# Tests for recursive nested archive scanning
+# ---------------------------------------------------------------------------
+
+
+def _make_zip_bytes(members: dict) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+def _make_tar_bytes(members: dict) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _malicious_pickle() -> bytes:
+    return pickle.dumps(Malicious1())
+
+
+_nested_malicious_result = ScanResult([Global("builtins", "eval", SafetyLevel.Dangerous)], 1, 1, 1)
+
+
+def test_nested_archive_zip_in_zip():
+    inner = _make_zip_bytes({"model.pkl": _malicious_pickle()})
+    outer = _make_zip_bytes({"inner.zip": inner})
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip"), _nested_malicious_result)
+
+
+def test_nested_archive_tar_in_zip():
+    inner = _make_tar_bytes({"model.pkl": _malicious_pickle()})
+    outer = _make_zip_bytes({"inner.tar": inner})
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip"), _nested_malicious_result)
+
+
+def test_nested_archive_zip_in_tar():
+    inner = _make_zip_bytes({"model.pkl": _malicious_pickle()})
+    outer = _make_tar_bytes({"inner.zip": inner})
+    compare_scan_results(scan_tar_bytes(io.BytesIO(outer), "outer.tar"), _nested_malicious_result)
+
+
+def test_nested_archive_deeply_nested():
+    # 3 levels of nesting stay within the default depth limit
+    level3 = _make_zip_bytes({"model.pkl": _malicious_pickle()})
+    level2 = _make_tar_bytes({"level3.zip": level3})
+    level1 = _make_zip_bytes({"level2.tar": level2})
+    outer = _make_zip_bytes({"level1.zip": level1})
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip"), _nested_malicious_result)
+
+
+def test_nested_archive_max_depth():
+    level3 = _make_zip_bytes({"model.pkl": _malicious_pickle()})
+    level2 = _make_tar_bytes({"level3.zip": level3})
+    level1 = _make_zip_bytes({"level2.tar": level2})
+    outer = _make_zip_bytes({"level1.zip": level1})
+    context = ArchiveScanContext(max_depth=1)
+    # level1.zip is scanned (depth 1) but level2.tar inside it exceeds the depth limit
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip", context=context), ScanResult([], 0, 0, 0))
+
+
+def test_nested_archive_pytorch_bin(tmp_path):
+    # Repro of the pipeline issue: a malicious model.pkl hidden in an inner zip member of an outer .bin
+    inner = _make_zip_bytes({"model.pkl": _malicious_pickle()})
+    path = tmp_path / "model.bin"
+    path.write_bytes(_make_zip_bytes({"archive/inner.zip": inner}))
+    compare_scan_results(scan_file_path(str(path)), _nested_malicious_result)
+
+
+def test_nested_archive_tar_file(tmp_path):
+    path = tmp_path / "model.tar"
+    path.write_bytes(_make_tar_bytes({"model.pkl": _malicious_pickle()}))
+    compare_scan_results(scan_file_path(str(path)), _nested_malicious_result)
+
+
+def test_nested_archive_member_chain_dedup():
+    # Members whose names normalize to the same chain are scanned only once
+    outer = _make_zip_bytes({"./model.pkl": _malicious_pickle(), "model.pkl": _malicious_pickle()})
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip"), _nested_malicious_result)
+
+
+def test_nested_archive_member_size_limit():
+    payload = _malicious_pickle()
+    outer = _make_zip_bytes({"model.pkl": payload})
+    context = ArchiveScanContext(max_member_size=len(payload) - 1)
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip", context=context), ScanResult([], 0, 0, 0))
+
+
+def test_nested_archive_total_size_limit():
+    payload = _malicious_pickle()
+    outer = _make_zip_bytes({"a.pkl": payload, "b.pkl": payload})
+    # The budget only fits the first member
+    context = ArchiveScanContext(max_total_size=len(payload))
+    compare_scan_results(scan_zip_bytes(io.BytesIO(outer), "outer.zip", context=context), _nested_malicious_result)
+
+
+def test_nested_archive_corrupt_member_does_not_affect_siblings():
+    archive = bytearray(_make_zip_bytes({"corrupt.pkl": _malicious_pickle(), "good.pkl": _malicious_pickle()}))
+    # Set the compression method of the first member to an unsupported value (local + central headers)
+    local_method_offset = 8
+    central_offset = archive.find(b"PK\x01\x02")
+    assert archive[:4] == b"PK\x03\x04" and central_offset != -1
+    archive[local_method_offset] = 99
+    archive[central_offset + 10] = 99
+
+    result = scan_zip_bytes(io.BytesIO(bytes(archive)), "outer.zip")
+    compare_scan_results(result, _nested_malicious_result)
+    assert result.scan_err is True
+
+
+def test_nested_archive_remote_url():
+    compare_scan_results(scan_url("https://localhost/mock/zip/nested_malicious"), _nested_malicious_result)
+
+
+def test_nested_archive_remote_huggingface():
+    compare_scan_results(scan_huggingface_model("ykilcher/nested-archive-model"), _nested_malicious_result)
